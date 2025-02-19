@@ -16,6 +16,7 @@ under the License.
 
 from collections import namedtuple
 from dataclasses import dataclass, field
+
 from dataclasses_json import dataclass_json, config
 from typing import TypeVar, Callable, ClassVar
 
@@ -31,6 +32,9 @@ from gs_quant.risk.transform import Transformer
 from gs_quant.target.backtests import BacktestTradingQuantityType
 
 action_count = 1
+
+
+Duration = Union[str, dt.date, dt.timedelta, CustomDuration]
 
 
 def default_transaction_cost():
@@ -101,6 +105,7 @@ class AddTradeAction(Action):
     :param trade_duration: an instrument attribute eg. 'expiration_date' or a date or a tenor or timedelta
                            if left as None the
                            trade will be added for all future dates
+                           can also specify 'next schedule' in order to exit at the next periodic trigger date
     :param name: optional additional name to the priceable name
     :param transaction_cost: optional a cash amount paid for each transaction, paid on both enter and exit
     """
@@ -108,8 +113,8 @@ class AddTradeAction(Action):
     priceables: Union[Instrument, Iterable[Instrument]] = field(default=None,
                                                                 metadata=config(decoder=decode_named_instrument,
                                                                                 encoder=encode_named_instrument))
-    trade_duration: Union[str, dt.date, dt.timedelta] = field(default=None,  # de/encoder doesn't handle timedelta
-                                                              metadata=config(decoder=decode_date_or_str))
+    trade_duration: Duration = field(default=None,  # de/encoder doesn't handle timedelta
+                                     metadata=config(decoder=decode_date_or_str))
     name: str = None
     transaction_cost: TransactionModel = field(default_factory=default_transaction_cost,
                                                metadata=config(decoder=dc_decode(ConstantTransactionModel)))
@@ -139,11 +144,11 @@ class AddTradeAction(Action):
         return self._dated_priceables
 
 
-AddTradeActionInfo = namedtuple('AddTradeActionInfo', 'scaling')
-EnterPositionQuantityScaledActionInfo = namedtuple('EnterPositionQuantityScaledActionInfo', 'not_applicable')
-HedgeActionInfo = namedtuple('HedgeActionInfo', 'not_applicable')
+AddTradeActionInfo = namedtuple('AddTradeActionInfo', ['scaling', 'next_schedule'])
+HedgeActionInfo = namedtuple('HedgeActionInfo', 'next_schedule')
 ExitTradeActionInfo = namedtuple('ExitTradeActionInfo', 'not_applicable')
 RebalanceActionInfo = namedtuple('RebalanceActionInfo', 'not_applicable')
+AddScaledTradeActionInfo = namedtuple('AddScaledActionInfo', 'next_schedule')
 
 
 @dataclass_json
@@ -158,6 +163,7 @@ class AddScaledTradeAction(Action):
     :param trade_duration: an instrument attribute eg. 'expiration_date' or a date or a tenor or timedelta
                            if left as None the
                            trade will be added for all future dates
+                           can also specify 'next schedule' in order to exit at the next periodic trigger date
     :param name: optional additional name to the priceable name
     :param scaling_type: the type of scaling we are doing
     :param scaling_risk: if the scaling type is a measure then this is the definition of the measure
@@ -167,14 +173,15 @@ class AddScaledTradeAction(Action):
     priceables: Union[Priceable, Iterable[Priceable]] = field(default=None,
                                                               metadata=config(decoder=decode_named_instrument,
                                                                               encoder=encode_named_instrument))
-    trade_duration: Union[str, dt.date, dt.timedelta] = field(default=None,  # de/encoder doesn't handle timedelta
-                                                              metadata=config(decoder=decode_date_or_str))
+    trade_duration: Duration = field(default=None,  # de/encoder doesn't handle timedelta
+                                     metadata=config(decoder=decode_date_or_str))
     name: str = None
     scaling_type: ScalingActionType = ScalingActionType.size
     scaling_risk: RiskMeasure = None
     scaling_level: Union[float, int] = 1
     transaction_cost: TransactionModel = field(default_factory=default_transaction_cost,
                                                metadata=config(decoder=dc_decode(ConstantTransactionModel)))
+    holiday_calendar: Iterable[dt.date] = None
     class_type: str = static_field('add_scaled_trade_action')
 
     def __post_init__(self):
@@ -207,8 +214,8 @@ class EnterPositionQuantityScaledAction(Action):
     priceables: Union[Priceable, Iterable[Priceable]] = field(default=None,
                                                               metadata=config(decoder=decode_named_instrument,
                                                                               encoder=encode_named_instrument))
-    trade_duration: Union[str, dt.date, dt.timedelta] = field(default=None,  # de/encoder doesn't handle timedelta
-                                                              metadata=config(decoder=decode_date_or_str))
+    trade_duration: Duration = field(default=None,  # de/encoder doesn't handle timedelta
+                                     metadata=config(decoder=decode_date_or_str))
     name: str = None
     trade_quantity: float = 1
     trade_quantity_type: BacktestTradingQuantityType = BacktestTradingQuantityType.quantity
@@ -262,12 +269,29 @@ class ExitAllPositionsAction(ExitTradeAction):
 @dataclass_json
 @dataclass
 class HedgeAction(Action):
+
+    """
+    create an action which adds a hedge trade when triggered.  This trade will be scaled to hedge the risk
+    specified.  The trades are resolved on the trigger date (state) and
+    last until the trade_duration if specified or for all future dates if not.
+    :param risk: a risk measure which should be hedged
+    :param priceables: a priceable or a list of pricables these should have sensitivity to the risk.
+    :param trade_duration: an instrument attribute eg. 'expiration_date' or a date or a tenor or timedelta
+                           if left as None the
+                           trade will be added for all future dates
+                           can also specify 'next schedule' in order to exit at the next periodic trigger date
+    :param name: optional additional name to the priceable name
+    :param transaction_cost: optional a transaction cost model, paid on both enter and exit
+    :param risk_transformation: optional a Transformer which will be applied to the raw risk numbers before hedging
+    :param holiday_calendar: optional an iterable list of holiday dates
+    """
+
     risk: RiskMeasure = field(default=None, metadata=config(decoder=decode_risk_measure,
                                                             encoder=encode_risk_measure))
     priceables: Optional[Priceable] = field(default=None, metadata=config(decoder=decode_named_instrument,
                                                                           encoder=encode_named_instrument))
-    trade_duration: Union[str, dt.date, dt.timedelta] = field(default=None,  # de/encoder doesn't handle timedelta
-                                                              metadata=config(decoder=decode_date_or_str))
+    trade_duration: Duration = field(default=None,  # de/encoder doesn't handle timedelta
+                                     metadata=config(decoder=decode_date_or_str))
     name: str = None
     csa_term: str = None
     scaling_parameter: str = 'notional_amount'

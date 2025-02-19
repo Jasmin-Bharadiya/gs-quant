@@ -45,6 +45,7 @@ from ..api_cache import ApiRequestCache
 from ...target.assets import EntityQuery, FieldFilterMap
 
 _logger = logging.getLogger(__name__)
+_REQUEST_HEADERS = "request_headers"
 
 
 class QueryType(Enum):
@@ -130,6 +131,7 @@ class QueryType(Enum):
     COVARIANCE = "Covariance"
     FACTOR_EXPOSURE = "Factor Exposure"
     FACTOR_RETURN = "Factor Return"
+    HISTORICAL_BETA = "Historical Beta"
     FACTOR_PNL = "Factor Pnl"
     FACTOR_PROPORTION_OF_RISK = "Factor Proportion Of Risk"
     DAILY_RISK = "Daily Risk"
@@ -180,47 +182,68 @@ class GsDataApi(DataApi):
         cls._api_request_cache = cache
 
     @classmethod
+    def _construct_cache_key(cls, url, **kwargs) -> tuple:
+        def fallback_encoder(v) -> str:
+            if isinstance(v, dt.date):
+                return v.isoformat()
+
+        def serialize_value(v):
+            if any(isinstance(v, class_) for class_ in {MDAPIDataQuery, DataQuery}):
+                return v.to_json(sort_keys=True, default=fallback_encoder)
+            encoded_v = fallback_encoder(v)
+            return encoded_v or v
+
+        json_kwargs = {
+            k: serialize_value(v)
+            for k, v in kwargs.items()
+            if k not in {_REQUEST_HEADERS}
+        }
+        cache_key = (url, 'POST', json_kwargs)
+        return cache_key
+
+    @classmethod
     def _check_cache(cls, url, **kwargs):
         session = cls.get_session()
-        cache_key = None
-        cached_val = None
+        cached_val, cache_key = None, None
         if cls._api_request_cache:
-            cache_key = (url, 'POST', kwargs)
+            cache_key = cls._construct_cache_key(url, **kwargs)
             cached_val = cls._api_request_cache.get(session, cache_key)
         return cached_val, cache_key, session
 
     @classmethod
-    def _post_with_cache_check(cls, url, domain=None, **kwargs):
-        result, cache_key, session = cls._check_cache(url, **kwargs)
+    def _post_with_cache_check(cls, url, validator=lambda x: x, domain=None, **kwargs):
+        result, cache_key, session = cls._check_cache(url=url, **kwargs)
         if result is None:
-            result = session._post(url, domain=domain, **kwargs)
+            result = validator(session._post(url, domain=domain, **kwargs))
             if cls._api_request_cache:
                 cls._api_request_cache.put(session, cache_key, result)
         return result
 
     @classmethod
-    def _get_with_cache_check(cls, url, domain=None, **kwargs):
+    def _get_with_cache_check(cls, url, validator=lambda x: x, domain=None, **kwargs):
         result, cache_key, session = cls._check_cache(url, **kwargs)
         if result is None:
-            result = session._get(url, domain=domain, **kwargs)
+            result = validator(session._get(url, domain=domain, **kwargs))
             if cls._api_request_cache:
                 cls._api_request_cache.put(session, cache_key, result)
         return result
 
     @classmethod
-    async def _get_with_cache_check_async(cls, url, domain=None, **kwargs):
+    async def _get_with_cache_check_async(cls, url, validator=lambda x: x, domain=None, **kwargs):
         result, cache_key, session = cls._check_cache(url, **kwargs)
         if result is None:
             result = await session._get_async(url, domain=domain, **kwargs)
+            result = validator(result)
             if cls._api_request_cache:
                 cls._api_request_cache.put(session, cache_key, result)
         return result
 
     @classmethod
-    async def _post_with_cache_check_async(cls, url, domain=None, **kwargs):
+    async def _post_with_cache_check_async(cls, url, validator=lambda x: x, domain=None, **kwargs):
         result, cache_key, session = cls._check_cache(url, **kwargs)
         if result is None:
             result = await session._post_async(url, domain=domain, **kwargs)
+            result = validator(result)
             if cls._api_request_cache:
                 cls._api_request_cache.put(session, cache_key, result)
         return result
@@ -257,7 +280,7 @@ class GsDataApi(DataApi):
     def execute_query(cls, dataset_id: str, query: Union[DataQuery, MDAPIDataQuery]):
         kwargs = {'payload': query}
         if getattr(query, 'format', None) in (Format.MessagePack, 'MessagePack'):
-            kwargs['request_headers'] = {'Accept': 'application/msgpack'}
+            kwargs[_REQUEST_HEADERS] = {'Accept': 'application/msgpack'}
 
         domain = cls._check_data_on_cloud(dataset_id)
         return cls._post_with_cache_check('/data/{}/query'.format(dataset_id), domain=domain, **kwargs)
@@ -266,7 +289,7 @@ class GsDataApi(DataApi):
     async def execute_query_async(cls, dataset_id: str, query: Union[DataQuery, MDAPIDataQuery]):
         kwargs = {'payload': query}
         if getattr(query, 'format', None) in (Format.MessagePack, 'MessagePack'):
-            kwargs['request_headers'] = {'Accept': 'application/msgpack'}
+            kwargs[_REQUEST_HEADERS] = {'Accept': 'application/msgpack'}
 
         domain = await cls._check_data_on_cloud_async(dataset_id)
         result = await cls._post_with_cache_check_async('/data/{}/query'.format(dataset_id), domain=domain, **kwargs)
@@ -945,9 +968,17 @@ class GsDataApi(DataApi):
 
     @classmethod
     def get_market_data(cls, query, request_id=None, ignore_errors: bool = False) -> pd.DataFrame:
+        def validate(body):
+            for e in body['responses']:
+                container = e['queryResponse'][0]
+                if 'errorMessages' in container:
+                    msg = f'measure service request {body["requestId"]} failed: {container["errorMessages"]}'
+                    raise MqValueError(msg)
+            return body
+
         start = time.perf_counter()
         try:
-            body = cls._post_with_cache_check('/data/measures', payload=query)
+            body = cls._post_with_cache_check(url='/data/measures', validator=validate, payload=query)
         except Exception as e:
             log_warning(request_id, _logger, f'Market data query {query} failed due to {e}')
             raise e

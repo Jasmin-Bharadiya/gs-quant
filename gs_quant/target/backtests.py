@@ -39,6 +39,8 @@ class BacktestRiskMeasureType(EnumBase, Enum):
     Price_ATMS = 'Price ATMS'
     Price_ATMF_Volatility = 'Price ATMF Volatility'
     Barrier_Level = 'Barrier Level'
+    Strike_Level_Adj_Implied = 'Strike Level Adj Implied'
+    Strike_Level_Adj_Realised = 'Strike Level Adj Realised'
 
 
 class BacktestTradingQuantityType(EnumBase, Enum):    
@@ -557,6 +559,7 @@ class BacktestRiskRequest(Base):
     measures: Tuple[BacktestRiskMeasureType, ...] = field(default=None, metadata=field_metadata)
     start_date: Optional[datetime.date] = field(default=None, metadata=field_metadata)
     end_date: Optional[datetime.date] = field(default=None, metadata=field_metadata)
+    dates: Optional[Tuple[datetime.date, ...]] = field(default=None, metadata=field_metadata)
     name: Optional[str] = field(default=None, metadata=name_metadata)
 
 
@@ -612,7 +615,7 @@ class Backtest(Base):
     mq_symbol: Optional[str] = field(default=None, metadata=field_metadata)
     owner_id: Optional[str] = field(default=None, metadata=field_metadata)
     report_ids: Optional[Tuple[str, ...]] = field(default=None, metadata=field_metadata)
-    parameters: Optional[DictBase] = field(default=None, metadata=field_metadata)
+    parameters: Optional[Union[BasketBacktestParameters, EnhancedBetaBacktestParameters, ISelectBacktestParameters, VolatilityBacktestParameters, VolatilityFlowBacktestParameters]] = field(default=None, metadata=field_metadata)
     start_date: Optional[datetime.date] = field(default=None, metadata=field_metadata)
     end_date: Optional[datetime.date] = field(default=None, metadata=field_metadata)
     version: Optional[float] = field(default=None, metadata=field_metadata)

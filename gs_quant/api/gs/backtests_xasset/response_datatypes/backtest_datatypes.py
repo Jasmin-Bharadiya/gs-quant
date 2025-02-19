@@ -26,7 +26,7 @@ from gs_quant.api.gs.backtests_xasset.json_encoders.request_encoders import legs
 from gs_quant.api.gs.backtests_xasset.json_encoders.response_datatypes.generic_datatype_encoders import \
     decode_daily_portfolio
 from gs_quant.instrument import Instrument
-from gs_quant.json_convertors import decode_optional_date
+from gs_quant.json_convertors import decode_optional_date, encode_date_tuple, decode_date_tuple
 from gs_quant.target.backtests import BacktestTradingQuantityType, EquityMarketModel
 from gs_quant.common import Currency, CurrencyName, PricingLocation
 
@@ -38,6 +38,20 @@ class TransactionCostModel(Enum):
 class TransactionDirection(Enum):
     Entry = 'Entry'
     Exit = 'Exit'
+
+
+class RollDateMode(Enum):
+    OTC = 'OTC'
+    Listed = 'Listed'
+
+    @classmethod
+    def _missing_(cls, value):
+        if value is None:
+            return None
+        for member in cls:
+            if member.value.lower() == value.lower():
+                return member
+        return None
 
 
 @dataclass_json(letter_case=LetterCase.CAMEL)
@@ -80,8 +94,12 @@ class DateConfig:
 @dataclass(unsafe_hash=True, repr=False)
 class Trade:
     legs: Optional[Tuple[Instrument, ...]] = field(default=None, metadata=config(decoder=legs_decoder))
-    buy_frequency: Optional[str] = None
-    holding_period: Optional[str] = None
+    buy_frequency: str = None
+    buy_dates: Optional[Tuple[dt.date, ...]] = field(default=None, metadata=config(encoder=encode_date_tuple,
+                                                                                   decoder=decode_date_tuple))
+    holding_period: str = None
+    exit_dates: Optional[Tuple[dt.date, ...]] = field(default=None, metadata=config(encoder=encode_date_tuple,
+                                                                                    decoder=decode_date_tuple))
     quantity: Optional[float] = None
     quantity_type: BacktestTradingQuantityType = BacktestTradingQuantityType.quantity
 
@@ -99,3 +117,4 @@ class Configuration:
     market_data_location: Optional[PricingLocation] = None
     market_model: Optional[EquityMarketModel] = None
     cash_accrual: bool = False
+    roll_date_mode: Optional[RollDateMode] = None

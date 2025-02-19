@@ -152,7 +152,7 @@ def _value_for_date(result: Union[DataFrameWithInfo, SeriesWithInfo], date: Unio
 
 
 def _get_value_with_info(value, risk_key, unit, error):
-    if isinstance(value, ErrorValue):
+    if isinstance(value, (ErrorValue, UnsupportedValue)):
         return value
     elif isinstance(value, pd.DataFrame):
         return DataFrameWithInfo(value, risk_key=risk_key, unit=unit, error=error)
@@ -450,7 +450,7 @@ class MultipleScenarioResult(dict):
                 raise ValueError('Can only index by date on historical results')
         return super().__getitem__(item)
 
-    def to_frame(self, values='default', index='default', columns='default', aggfunc=sum,
+    def to_frame(self, values='default', index='default', columns='default', aggfunc="sum",
                  display_options: DisplayOptions = None):
         df = pd.DataFrame.from_records(self._to_records({}, display_options=display_options))
         if values is None and index is None and columns is None:
@@ -484,7 +484,7 @@ class HistoricalPricingFuture(CompositeResultFuture):
 
     def _set_result(self):
         results = [f.result() for f in self.futures]
-        base = next((r for r in results if not isinstance(r, (ErrorValue, UnsupportedValue, Exception))), None)
+        base = next((r for r in results if not isinstance(r, (ErrorValue, Exception))), None)
 
         if base is None:
             _logger.error(f'Historical pricing failed: {results[0]}')
@@ -809,7 +809,7 @@ class PortfolioRiskResult(CompositeResultFuture):
                 records.extend(future_records[i]._to_records({**portfolio_records[i]}, display_options))
         return records
 
-    def to_frame(self, values='default', index='default', columns='default', aggfunc=sum,
+    def to_frame(self, values='default', index='default', columns='default', aggfunc="sum",
                  display_options: DisplayOptions = None):
         final_records = self._to_records(display_options=display_options)
         if len(final_records) > 0:

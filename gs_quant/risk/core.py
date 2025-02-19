@@ -19,7 +19,7 @@ from abc import ABCMeta, abstractmethod
 from concurrent.futures import Future
 from copy import copy
 from dataclasses import dataclass, fields
-from typing import Iterable, Optional, Union, Tuple, Dict
+from typing import Iterable, Optional, Union, Tuple, Dict, Callable, List
 
 import pandas as pd
 from dataclasses_json import dataclass_json
@@ -94,6 +94,10 @@ class ResultInfo(metaclass=ABCMeta):
 
             if isinstance(component, (ErrorValue, Exception)):
                 errors[date] = component
+            elif isinstance(component, UnsupportedValue):
+                values.append(component)
+                dates.append(date)
+                unit = None
             else:
                 values.append(component.raw_value)
                 dates.append(date)
@@ -133,6 +137,14 @@ class UnsupportedValue(ResultInfo):
     @property
     def raw_value(self):
         return 'Unsupported Value'
+
+    @staticmethod
+    def compose(components: Iterable):
+        dates, values, errors, risk_key, unit = ResultInfo.composition_info(components)
+        return SeriesWithInfo(pd.Series(index=pd.DatetimeIndex(dates).date, data=values),
+                              risk_key=risk_key,
+                              unit=unit,
+                              error=errors)
 
     def _to_records(self, extra_dict, display_options: DisplayOptions = None):
         if display_options is not None and not isinstance(display_options, DisplayOptions):
@@ -485,7 +497,7 @@ def aggregate_results(results: Iterable[ResultType], allow_mismatch_risk_keys=Fa
 
         if result.unit:
             if unit and unit != result.unit:
-                raise ValueError('Cannot aggregate results with different units')
+                raise ValueError(f'Cannot aggregate results with different units for {result.risk_key.risk_measure}')
 
             unit = unit or result.unit
 
@@ -541,7 +553,7 @@ def subtract_risk(left: DataFrameWithInfo, right: DataFrameWithInfo) -> pd.DataF
 
 def sort_values(data: Iterable, columns: Tuple[str, ...], by: Tuple[str, ...]) -> Iterable:
     indices = tuple(columns.index(c) for c in by if c in columns)
-    fns = [None] * len(columns)
+    fns: List[Optional[Callable[[any], Optional[float]]]] = [None] * len(columns)
     for idx in indices:
         fns[idx] = __column_sort_fns.get(columns[idx])
 
@@ -560,11 +572,11 @@ def sort_risk(df: pd.DataFrame, by: Tuple[str, ...] = __risk_columns) -> pd.Data
     :return: A sorted Dataframe
     """
     columns = tuple(df.columns)
-    data = sort_values((row for _, row in df.iterrows()), columns, by)
-    fields = [f for f in by if f in columns]
-    fields.extend(f for f in columns if f not in fields)
+    data = sort_values(df.values, columns, by)
+    df_fields = [f for f in by if f in columns]
+    df_fields.extend(f for f in columns if f not in df_fields)
 
-    result = pd.DataFrame.from_records(data, columns=columns)[fields]
+    result = pd.DataFrame.from_records(data, columns=columns)[df_fields]
     if 'date' in result:
         result = result.set_index('date')
 

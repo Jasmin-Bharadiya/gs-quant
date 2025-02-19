@@ -231,6 +231,7 @@ class SecurityIdentifier(EntityIdentifier):
     ID = "id"
     CUSIP = "cusip"
     CUSIP8 = "cusip8"
+    CINS = "cins"
     SEDOL = "sedol"
     ISIN = "isin"
     TICKER = "ticker"
@@ -241,6 +242,7 @@ class SecurityIdentifier(EntityIdentifier):
     BBG = "bbg"
     ASSET_ID = "assetId"
     ANY = "identifiers"
+    BARRA_ID = "barraId"
 
 
 class ReturnType(Enum):
@@ -1149,7 +1151,7 @@ class FutureContract(Asset):
     def __init__(self,
                  id_: str,
                  asset_class: Union[AssetClass, str],
-                 name: Union[AssetClass, str],
+                 name: str,
                  entity: Optional[Dict] = None):
         if isinstance(asset_class, str):
             asset_class = get_enum_value(AssetClass, asset_class)
@@ -1456,7 +1458,7 @@ class SecurityMaster:
             return Fund(gs_asset.id, gs_asset.name, gs_asset.assetClass, entity=asset_entity)
 
         if asset_type == GsAssetType.Default_Swap.value:
-            return DefaultSwap(gs_asset.id, gs_asset.asset_class, entity=asset_entity)
+            return DefaultSwap(gs_asset.id, gs_asset.name, entity=asset_entity)
 
         if asset_type == GsAssetType.Swaption.value:
             return Swaption(gs_asset.id, gs_asset.name, entity=asset_entity)
@@ -1490,6 +1492,47 @@ class SecurityMaster:
     @classmethod
     def set_source(cls, source: SecurityMasterSource):
         cls._source = source
+
+    @classmethod
+    def _get_asset_query(cls,
+                         id_value: Union[str, List[str]],
+                         id_type: Union[AssetIdentifier, SecurityIdentifier],
+                         as_of: Union[dt.date, dt.datetime] = None,
+                         exchange_code: ExchangeCode = None,
+                         asset_type: AssetType = None) -> Tuple[Dict, dt.datetime]:
+        if not as_of:
+            current = PricingContext.current
+            if not current.is_entered:
+                with current:
+                    as_of = current.pricing_date
+            else:
+                as_of = current.pricing_date
+        if isinstance(as_of, dt.date):
+            as_of = dt.datetime.combine(as_of, dt.time(0, 0), pytz.utc)
+        query = {id_type.value.lower(): id_value}
+        if exchange_code is not None:
+            query['exchange'] = exchange_code.value
+        if asset_type is not None:
+            query['type'] = [t.value for t in cls.__asset_type_to_gs_types(asset_type)]
+        return query, as_of
+
+    @classmethod
+    def _get_asset_results(cls, results, sort_by_rank) -> Asset:
+        if sort_by_rank:
+            result = get(results, '0')
+            if result:
+                result = GsAsset.from_dict(result)
+        else:
+            result = next(iter(results), None)
+        if result:
+            return cls.__gs_asset_to_asset(result)
+        return None
+
+    @classmethod
+    def _get_many_assets_results(cls, results) -> List[Asset]:
+        if results is not None:
+            return [cls.__gs_asset_to_asset(result) for result in results]
+        return []
 
     @classmethod
     def get_asset(cls,
@@ -1544,48 +1587,193 @@ class SecurityMaster:
                 raise NotImplementedError('argument not implemented for Security Master (supported in Asset Service)')
             return cls._get_security_master_asset(id_value, id_type, as_of=as_of, fields=fields)
 
-        if not as_of:
-            current = PricingContext.current
-            if not current.is_entered:
-                with current:
-                    as_of = current.pricing_date
-            else:
-                as_of = current.pricing_date
-
-        if isinstance(as_of, dt.date):
-            as_of = dt.datetime.combine(as_of, dt.time(0, 0), pytz.utc)
-
         if id_type is AssetIdentifier.MARQUEE_ID:
             gs_asset = GsAssetApi.get_asset(id_value)
             return cls.__gs_asset_to_asset(gs_asset)
 
-        query = {id_type.value.lower(): id_value}
-
-        if exchange_code is not None:
-            query['exchange'] = exchange_code.value
-
-        if asset_type is not None:
-            query['type'] = [t.value for t in cls.__asset_type_to_gs_types(asset_type)]
-
+        query, as_of = cls._get_asset_query(id_value, id_type, as_of, exchange_code, asset_type)
         if sort_by_rank:
             results = GsAssetApi.get_many_assets(as_of=as_of, return_type=dict, order_by=['>rank'], **query)
-            result = get(results, '0')
-
-            if result:
-                result = GsAsset.from_dict(result)
+            return cls._get_asset_results(results, sort_by_rank)
         else:
             results = GsAssetApi.get_many_assets(as_of=as_of, **query)
-            result = next(iter(results), None)
-
-        if result:
-            return cls.__gs_asset_to_asset(result)
+            return cls._get_asset_results(results, sort_by_rank)
 
     @classmethod
-    def _get_security_master_asset(cls,
-                                   id_value: str,
-                                   id_type: SecurityIdentifier,
-                                   as_of: Union[dt.date, dt.datetime] = None,
-                                   fields: Optional[List[str]] = None) -> SecMasterAsset:
+    async def get_asset_async(cls,
+                              id_value: str,
+                              id_type: Union[AssetIdentifier, SecurityIdentifier],
+                              as_of: Union[dt.date, dt.datetime] = None,
+                              exchange_code: ExchangeCode = None,
+                              asset_type: AssetType = None,
+                              sort_by_rank: bool = True,
+                              fields: Optional[List[str]] = None) -> Asset:
+        """
+        Get an asset by identifier and identifier type
+
+        :param id_value: identifier value
+        :param id_type: identifier type
+        :param exchange_code: exchange code
+        :param asset_type: asset type
+        :param as_of: As of date for query
+        :param sort_by_rank: whether to sort assets by rank. This flag is ignored when using SecMasterContext
+        :param fields: asset fields to return
+        :return: Asset object or None
+
+        **Usage**
+
+        Get asset object using a specified identifier and identifier type. Where the identifiers are temporal (and can
+        change over time), will use the current MarketContext to evaluate based on the specified date.
+
+        **Examples**
+
+        Get asset by bloomberg id:
+
+        >>> gs = await SecurityMaster.get_asset_async("GS UN", AssetIdentifier.BLOOMBERG_ID)
+
+        Get asset by ticker and exchange code:
+
+        >>> gs = await SecurityMaster.get_asset_async("GS", AssetIdentifier.TICKER, exchange_code=ExchangeCode.NYSE)
+
+        Get asset by ticker and asset type:
+
+        >>> spx = await SecurityMaster.get_asset_async("SPX", AssetIdentifier.TICKER, asset_type=AssetType.INDEX)
+
+        **See also**
+
+        :class:`AssetIdentifier`
+        :func:`get_many_assets`
+
+        """
+        if cls._source == SecurityMasterSource.SECURITY_MASTER:
+            if not isinstance(id_type, SecurityIdentifier):
+                raise MqTypeError('expected a security identifier')
+            if exchange_code or asset_type:
+                raise NotImplementedError('argument not implemented for Security Master (supported in Asset Service)')
+            return await cls._get_security_master_asset_async(id_value, id_type, as_of=as_of, fields=fields)
+
+        if id_type is AssetIdentifier.MARQUEE_ID:
+            gs_asset = await GsAssetApi.get_asset_async(id_value)
+            return cls.__gs_asset_to_asset(gs_asset)
+
+        query, as_of = cls._get_asset_query(id_value, id_type, as_of, exchange_code, asset_type)
+        if sort_by_rank:
+            results = await GsAssetApi.get_many_assets_async(as_of=as_of, return_type=dict, order_by=['>rank'], **query)
+            return cls._get_asset_results(results, sort_by_rank)
+        else:
+            results = await GsAssetApi.get_many_assets_async(as_of=as_of, **query)
+            return cls._get_asset_results(results, sort_by_rank)
+
+    @classmethod
+    def get_many_assets(cls,
+                        id_values: List[str],
+                        id_type: AssetIdentifier,
+                        limit: int = 100,
+                        as_of: Union[dt.date, dt.datetime] = None,
+                        exchange_code: ExchangeCode = None,
+                        sort_by_rank: bool = True) -> List[Asset]:
+        """
+        Get an asset by identifier and identifier type
+
+        :param id_values: identifier values
+        :param id_type: identifiers type
+        :param limit: max number of results
+        :param exchange_code: exchange code
+        :param as_of: As of date for query
+        :param sort_by_rank: whether to sort assets by rank. This flag is ignored when using SecMasterContext
+        :return: list of Asset objects or None
+
+        **Usage**
+
+        Get asset object using a specified identifier and identifier type. Where the identifiers are temporal (and can
+        change over time), will use the current MarketContext to evaluate based on the specified date.
+
+        **Examples**
+
+        Get asset by bloomberg id:
+
+        >>> gs = SecurityMaster.get_many_assets(["GS UN", "MSFT UW"], AssetIdentifier.BLOOMBERG_ID)
+
+        Get asset by ticker and exchange code:
+
+        >>> gs = SecurityMaster.get_many_assets(["GS", "MSFT"], AssetIdentifier.TICKER, exchange_code=ExchangeCode.NYSE)
+
+        Get asset by ticker and asset type:
+
+        >>> spx = SecurityMaster.get_many_assets(["SPX"], AssetIdentifier.TICKER, asset_type=AssetType.INDEX)
+
+        **See also**
+
+        :class:`AssetIdentifier`
+        :func:`get_many_assets`
+
+        """
+        query, as_of = cls._get_asset_query(id_values, id_type, as_of, exchange_code)
+        if sort_by_rank:
+            results = GsAssetApi.get_many_assets(as_of=as_of, order_by=['>rank'], limit=limit, **query)
+        else:
+            results = GsAssetApi.get_many_assets(as_of=as_of, limit=limit, **query)
+        return cls._get_many_assets_results(results)
+
+    @classmethod
+    async def get_many_assets_async(cls,
+                                    id_values: List[str],
+                                    id_type: AssetIdentifier,
+                                    limit: int = 100,
+                                    as_of: Union[dt.date, dt.datetime] = None,
+                                    exchange_code: ExchangeCode = None,
+                                    sort_by_rank: bool = True) -> List[Asset]:
+        """
+        Get an asset by identifier and identifier type
+
+        :param id_values: identifier values
+        :param id_type: identifiers type
+        :param limit: max number of results
+        :param exchange_code: exchange code
+        :param as_of: As of date for query
+        :param sort_by_rank: whether to sort assets by rank. This flag is ignored when using SecMasterContext
+        :return: list of Asset objects or None
+
+        **Usage**
+
+        Get asset object using a specified identifier and identifier type. Where the identifiers are temporal (and can
+        change over time), will use the current MarketContext to evaluate based on the specified date.
+
+        **Examples**
+
+        Get asset by bloomberg id:
+
+        >>> gs = await SecurityMaster.get_many_assets_async(["GS UN"], AssetIdentifier.BLOOMBERG_ID)
+
+        Get asset by ticker and exchange code:
+
+        >>> gs = await SecurityMaster.get_many_assets_async(["GS"], AssetIdentifier.TICKER,
+        >>>                                                 exchange_code=ExchangeCode.NYSE)
+
+        Get asset by ticker and asset type:
+
+        >>> spx = await SecurityMaster.get_many_assets_async(["SPX"], AssetIdentifier.TICKER,
+        >>>                                                  asset_type=AssetType.INDEX)
+
+        **See also**
+
+        :class:`AssetIdentifier`
+        :func:`get_many_assets`
+
+        """
+        query, as_of = cls._get_asset_query(id_values, id_type, as_of, exchange_code)
+        if sort_by_rank:
+            results = await GsAssetApi.get_many_assets_async(as_of=as_of, order_by=['>rank'], limit=limit, **query)
+        else:
+            results = await GsAssetApi.get_many_assets_async(as_of=as_of, limit=limit, **query)
+        return cls._get_many_assets_results(results)
+
+    @classmethod
+    def _get_security_master_asset_params(cls,
+                                          id_value: str,
+                                          id_type: SecurityIdentifier,
+                                          as_of: Union[dt.date, dt.datetime] = None,
+                                          fields: Optional[List[str]] = None) -> dict:
         as_of = as_of or datetime.datetime(2100, 1, 1)
         type_ = id_type.value
         params = {
@@ -1603,11 +1791,13 @@ class SecurityMaster:
             }
             request_fields.update(fields)
             params['fields'] = request_fields
+        return params
 
-        r = GsSession.current._get('/markets/securities', payload=params)
-        if r['totalResults'] == 0:
+    @classmethod
+    def _get_security_master_asset_response(cls, response) -> SecMasterAsset:
+        if response['totalResults'] == 0:
             return None
-        asset_dict = r['results'][0]
+        asset_dict = response['results'][0]
         asset_id = asset_dict['identifiers'].get("assetId", None)
         # Converting dict to Asset Class
         asset_name = asset_dict.get('name', None)
@@ -1626,6 +1816,26 @@ class SecurityMaster:
         except ValueError:
             raise NotImplementedError(f"Not yet implemented for AssetType={asset_dict['type']}, "
                                       f"AssetClass={asset_dict['assetClass']}.")
+
+    @classmethod
+    def _get_security_master_asset(cls,
+                                   id_value: str,
+                                   id_type: SecurityIdentifier,
+                                   as_of: Union[dt.date, dt.datetime] = None,
+                                   fields: Optional[List[str]] = None) -> SecMasterAsset:
+        params = cls._get_security_master_asset_params(id_value, id_type, as_of, fields)
+        response = GsSession.current._get('/markets/securities', payload=params)
+        return cls._get_security_master_asset_response(response)
+
+    @classmethod
+    async def _get_security_master_asset_async(cls,
+                                               id_value: str,
+                                               id_type: SecurityIdentifier,
+                                               as_of: Union[dt.date, dt.datetime] = None,
+                                               fields: Optional[List[str]] = None) -> SecMasterAsset:
+        params = cls._get_security_master_asset_params(id_value, id_type, as_of, fields)
+        response = await GsSession.current._get_async('/markets/securities', payload=params)
+        return cls._get_security_master_asset_response(response)
 
     @classmethod
     def get_identifiers(cls, id_values: List[str], id_type: SecurityIdentifier, as_of: datetime.datetime = None,

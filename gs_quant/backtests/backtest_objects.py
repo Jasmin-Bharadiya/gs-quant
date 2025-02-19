@@ -16,8 +16,9 @@ under the License.
 from abc import ABC
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
-from dataclasses_json import dataclass_json
+from dataclasses import dataclass, field
+from dataclasses_json import dataclass_json, config
+from enum import Enum
 from queue import Queue as FifoQueue
 from typing import Iterable, TypeVar, Optional, Union
 
@@ -28,13 +29,17 @@ import pandas as pd
 from gs_quant.backtests.backtest_utils import make_list
 from gs_quant.backtests.core import ValuationMethod
 from gs_quant.backtests.data_handler import DataHandler
+from gs_quant.backtests.data_sources import DataSource, GenericDataSource, MissingDataStrategy
 from gs_quant.backtests.event import FillEvent
 from gs_quant.backtests.order import OrderBase, OrderCost
-from gs_quant.base import static_field
+from gs_quant.base import field_metadata, static_field
 from gs_quant.common import RiskMeasure
-from gs_quant.instrument import Cash
+from gs_quant.datetime.relative_date import RelativeDate
+from gs_quant.instrument import Cash, IRSwap
+from gs_quant.json_convertors import dc_decode
 from gs_quant.markets import PricingContext
 from gs_quant.markets.portfolio import Portfolio
+from gs_quant.risk import ErrorValue, Cashflows
 from gs_quant.risk.transform import Transformer
 
 
@@ -45,6 +50,34 @@ class BaseBacktest(ABC):
 TBaseBacktest = TypeVar('TBaseBacktest', bound='BaseBacktest')
 
 
+class TransactionAggType(Enum):
+    SUM = 'sum'
+    MAX = 'max'
+    MIN = 'min'
+
+
+@dataclass_json()
+@dataclass
+class PnlAttribute:
+    attribute_name: str
+    attribute_metric: RiskMeasure
+    market_data_metric: RiskMeasure
+    scaling_factor: float
+    second_order: bool = False
+
+    def get_risks(self):
+        return [self.attribute_metric, self.market_data_metric]
+
+
+@dataclass_json()
+@dataclass
+class PnlDefinition:
+    attributes: Iterable[PnlAttribute]
+
+    def get_risks(self):
+        return [risk for attribute in self.attributes for risk in attribute.get_risks()]
+
+
 @dataclass_json
 @dataclass
 class BackTest(BaseBacktest):
@@ -53,6 +86,7 @@ class BackTest(BaseBacktest):
     risks: Iterable[RiskMeasure]
     price_measure: RiskMeasure
     holiday_calendar: Iterable[dt.date] = None
+    pnl_explain_def: Optional[PnlDefinition] = None
 
     def __post_init__(self):
         self._portfolio_dict = defaultdict(Portfolio)  # portfolio by state
@@ -62,7 +96,9 @@ class BackTest(BaseBacktest):
         self._transaction_costs = defaultdict(int)  # list of transaction costs by date
         self.strategy = deepcopy(self.strategy)  # the strategy definition
         self._results = defaultdict(list)
+        self._trade_exit_risk_results = defaultdict(list)
         self.risks = make_list(self.risks)  # list of risks to calculate
+        self._risk_summary_dict = None  # Summary dict shared between output views, only initialized once
         self._calc_calls = 0
         self._calculations = 0
 
@@ -112,6 +148,10 @@ class BackTest(BaseBacktest):
             self._results[date] = results
 
     @property
+    def trade_exit_risk_results(self):
+        return self._trade_exit_risk_results
+
+    @property
     def calc_calls(self):
         return self._calc_calls
 
@@ -127,18 +167,36 @@ class BackTest(BaseBacktest):
     def calculations(self, calculations):
         self._calculations = calculations
 
+    def get_risk_summary_dict(self, zero_on_empty_dates=False):
+        if self._risk_summary_dict is not None:
+            summary_dict = self._risk_summary_dict
+        else:
+            if not self._results:
+                raise ValueError('Must run generic engine and populate results before results summary dict')
+            dates_with_results = list(filter(lambda x: len(x[1]), self._results.items()))
+            summary_dict = defaultdict(dict)
+            for date, results in dates_with_results:
+                for risk in results.risk_measures:
+                    try:
+                        value = results[risk].aggregate(True, True)
+                    except TypeError:
+                        value = ErrorValue(None, error='Could not aggregate risk results')
+                    summary_dict[date][risk] = value
+            self._risk_summary_dict = summary_dict
+        zero_risk_sd_copy = summary_dict.copy()
+        if zero_on_empty_dates:
+            for cash_only_date in set(self._cash_dict.keys()).difference(zero_risk_sd_copy.keys()):
+                for risk in self.risks:
+                    zero_risk_sd_copy[cash_only_date][risk] = 0
+        return zero_risk_sd_copy
+
     @property
     def result_summary(self):
         """
         Get a dataframe showing the PV and other risks and cash on each day in the backtest
-        :param show_units: choose to show the units in the column names
-        :type show_units: bool default False
-        :return: bool default False
-        :rtype: pandas.dataframe
         """
-        dates_with_results = list(filter(lambda x: len(x[1]), self._results.items()))
-        summary = pd.DataFrame({date: {risk: results[risk].aggregate(True, True)
-                                       for risk in results.risk_measures} for date, results in dates_with_results}).T
+        summary_dict = self.get_risk_summary_dict()
+        summary = pd.DataFrame(summary_dict).T
         cash_summary = defaultdict(dict)
         for date, results in self._cash_dict.items():
             for ccy, value in results.items():
@@ -148,11 +206,18 @@ class BackTest(BaseBacktest):
         cash = pd.concat([pd.Series(cash_dict, name='Cumulative Cash')
                           for name, cash_dict in cash_summary.items()], axis=1, sort=True)
         transaction_costs = pd.Series(self.transaction_costs, name='Transaction Costs')
+        transaction_costs = transaction_costs.sort_index().cumsum()
         df = pd.concat([summary, cash, transaction_costs], axis=1, sort=True).ffill().fillna(0)
-        # cum sum the transaction_costs
-        df['Transaction Costs'] = df['Transaction Costs'].cumsum()
         df['Total'] = df[self.price_measure] + df['Cumulative Cash'] + df['Transaction Costs']
         return df[:self.states[-1]]
+
+    @property
+    def risk_summary(self):
+        """
+        Get a dataframe showing the risks in the backtest with zero values for days with no instruments held
+        """
+        summary_dict = self.get_risk_summary_dict(zero_on_empty_dates=True)
+        return pd.DataFrame(summary_dict).T.sort_index()
 
     def trade_ledger(self):
         # this is a ledger of each instrument when it was entered and when it was closed out.  The cash associated
@@ -229,6 +294,50 @@ class BackTest(BaseBacktest):
 
         return result.sort_index()
 
+    def pnl_explain(self):
+        """
+        Get a dictionary of risk attributions which explain the pnl
+        """
+        if self.pnl_explain_def is None:
+            return None
+
+        risk_results = self.results
+        exit_risk_results = self.trade_exit_risk_results
+        dates = sorted(set(risk_results.keys()).union(exit_risk_results.keys()))
+
+        pnl_explain_results = {}
+
+        for attribute in self.pnl_explain_def.attributes:
+            result = {}
+            cum_total = 0.0
+            for idx in range(1, len(dates)):
+                metric_pnl = 0.0
+                cur_date = dates[idx]
+                prev_date = dates[idx - 1]
+                if prev_date not in risk_results:
+                    result[cur_date] = cum_total
+                    continue
+                for prev_date_inst in risk_results[prev_date].portfolio.all_instruments:
+                    prev_date_risk = risk_results[prev_date][prev_date_inst][attribute.attribute_metric]
+                    if prev_date_risk == 0:
+                        continue
+                    prev_date_mkt_data = risk_results[prev_date][prev_date_inst][attribute.market_data_metric]
+                    if cur_date in risk_results and prev_date_inst in risk_results[cur_date].portfolio:
+                        cur_date_mkt_data = risk_results[cur_date][prev_date_inst][attribute.market_data_metric]
+                    else:
+                        cur_date_mkt_data = exit_risk_results[cur_date][prev_date_inst][attribute.market_data_metric]
+                    if attribute.second_order:
+                        metric_pnl += (0.5 * attribute.scaling_factor * prev_date_risk *
+                                       (cur_date_mkt_data - prev_date_mkt_data) *
+                                       (cur_date_mkt_data - prev_date_mkt_data))
+                    else:
+                        metric_pnl += (attribute.scaling_factor * prev_date_risk *
+                                       (cur_date_mkt_data - prev_date_mkt_data))
+                cum_total += metric_pnl
+                result[cur_date] = cum_total
+            pnl_explain_results[attribute.attribute_name] = result
+        return pnl_explain_results
+
 
 class ScalingPortfolio:
     def __init__(self, trade, dates, risk, csa_term=None, scaling_parameter='notional_amount',
@@ -304,6 +413,23 @@ class ScaledTransactionModel:
             backtest.calc_calls += 1
             backtest.calculations += 1
         return risk.result() * self.scaling_level
+
+
+@dataclass_json()
+@dataclass
+class AggregateTransactionModel:
+    transaction_models: tuple = tuple()
+    aggregate_type: TransactionAggType = field(default=TransactionAggType.SUM, metadata=field_metadata)
+
+    def get_cost(self, state, backtest, info, instrument) -> float:
+        if self.aggregate_type == TransactionAggType.SUM:
+            return sum(model.get_cost(state, backtest, info, instrument) for model in self.transaction_models)
+        elif self.aggregate_type == TransactionAggType.MAX:
+            return max(model.get_cost(state, backtest, info, instrument) for model in self.transaction_models)
+        elif self.aggregate_type == TransactionAggType.MIN:
+            return min(model.get_cost(state, backtest, info, instrument) for model in self.transaction_models)
+        else:
+            raise RuntimeError(f'unrecognised aggregation type:{str(self.aggregation_type)}')
 
 
 @dataclass_json
@@ -424,3 +550,79 @@ class PredefinedAssetBacktest(BaseBacktest):
     def get_orders_for_date(self, date: dt.date) -> pd.DataFrame():
         return pd.DataFrame([order.to_dict(self.data_handler) for order in self.orders
                              if order.execution_end_time().date() == date])
+
+
+@dataclass_json
+@dataclass
+class CashAccrualModel:
+    class_type: str = static_field('cash_accrual_model')
+
+    def get_accrued_value(self, current_value, to_state) -> dict:
+        pass
+
+
+@dataclass_json
+@dataclass
+class ConstantCashAccrualModel(CashAccrualModel):
+    rate: float = 0
+    annual: bool = True
+    class_type: str = static_field('cash_accrual_model')
+
+    def get_accrued_value(self, current_value, to_state) -> dict:
+        new_value = {}
+        from_state = current_value[1]
+        days = (to_state - from_state).days
+        for currency, value in current_value[0].items():
+            new_value[currency] = value * (1 + (self.rate / (365 if self.annual else 1))) ** days
+
+        return new_value
+
+
+@dataclass_json
+@dataclass
+class DataCashAccrualModel(CashAccrualModel):
+    data_source: DataSource = field(default=None, metadata=config(decoder=dc_decode(*DataSource.sub_classes(),
+                                                                                    allow_missing=True)))
+    annual: bool = True
+    class_type: str = static_field('cash_accrual_model')
+
+    def get_accrued_value(self, current_value, to_state) -> dict:
+        new_value = {}
+        from_state = current_value[1]
+        days = (to_state - from_state).days
+        rate = self.data_source.get_data(from_state)
+        for currency, value in current_value[0].items():
+            new_value[currency] = value * (1 + (rate / (365 if self.annual else 1))) ** days
+        return new_value
+
+
+ois_fixings = {}
+
+
+@dataclass_json
+@dataclass
+class OisFixingCashAccrualModel(CashAccrualModel):
+    start_date: Union[dt.date, str] = '-1y'
+    end_date: Union[dt.date, str] = dt.date.today()
+    class_type: str = static_field('ois_fixing_cash_accrual_model')
+
+    def get_accrued_value(self, current_value, to_state) -> dict:
+        for currency in current_value[0].keys():
+            if currency not in ois_fixings:
+                start_date = self.start_date if isinstance(self.start_date, dt.date) else RelativeDate(
+                    self.start_date).apply_rule()
+                start_date = (start_date - dt.timedelta(days=7))
+                swap = IRSwap(notional_currency=currency,
+                              floating_rate_frequency='1b',
+                              effective_date=start_date,
+                              termination_date=self.end_date if isinstance(self.end_date, dt.date) else RelativeDate(
+                                  self.end_date).apply_rule(),
+                              floating_rate_option='OIS')
+                with PricingContext():
+                    result = swap.calc(Cashflows)
+
+                ois_fixings[currency] = GenericDataSource(
+                    result.result()[result.result()['payment_type'] == 'Flt'].set_index(['accrual_start_date'])['rate'],
+                    MissingDataStrategy.fill_forward)
+            ds_accrual_model = DataCashAccrualModel(ois_fixings[currency], True)
+            return ds_accrual_model.get_accrued_value(current_value, to_state)

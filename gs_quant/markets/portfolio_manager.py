@@ -23,7 +23,7 @@ import pandas as pd
 
 from gs_quant.api.gs.portfolios import GsPortfolioApi
 from gs_quant.api.gs.reports import GsReportApi
-from gs_quant.entities.entitlements import Entitlements
+from gs_quant.entities.entitlements import Entitlements, EntitlementBlock, User
 from gs_quant.entities.entity import PositionedEntity, EntityType, ScenarioCalculationMeasure
 from gs_quant.errors import MqError
 from gs_quant.errors import MqValueError
@@ -101,6 +101,7 @@ class PortfolioManager(PositionedEntity):
 
         :param tags: If the portfolio is a fund of funds, pass in a dictionary corresponding to the tag values
         to retrieve results for a sub-portfolio
+
         :return: returns the PerformanceReport associated with portfolio if one exists
         """
         reports = GsReportApi.get_reports(limit=100,
@@ -108,6 +109,12 @@ class PortfolioManager(PositionedEntity):
                                           position_source_id=self.id,
                                           report_type='Portfolio Performance Analytics',
                                           tags=tags)
+
+        # If tags is set to None, it returns all PPA reports for the portfolio,
+        # and returning reports[0] can return any one PPA, so specifically if tags is None it means we are
+        # looking for the root PPA, we need to explicitly filter out and get the one report where tags is None
+        if tags is None:
+            reports = [report for report in reports if report.parameters.tags is None]
         if len(reports) == 0:
             raise MqError('No performance report found.')
         return PerformanceReport.from_target(reports[0])
@@ -261,11 +268,38 @@ class PortfolioManager(PositionedEntity):
         >>>
         >>> pm = PortfolioManager("PORTFOLIO ID")
         >>> pm.set_entitlements(entitlements)
+
+        **See Also**
+        :func: PortfolioManager.share
+        :func: PortfolioManager.get_entitlements
         """
         entitlements_as_target = entitlements.to_target()
         portfolio_as_target = GsPortfolioApi.get_portfolio(self.__portfolio_id)
         portfolio_as_target.entitlements = entitlements_as_target
         GsPortfolioApi.update_portfolio(portfolio_as_target)
+
+    def share(self, emails: List[str], admin: bool = False):
+        """
+        Share a portfolio with a list of emails
+
+        :param emails: list of emails to share the portfolio with
+        :param admin: true if the users should have admin access; defaults to false
+
+        **Examples**
+
+        >>> pm = PortfolioManager("PORTFOLIO ID")
+        >>> pm.share(['EMAIL1', 'EMAIL2'])
+        """
+        current_entitlements = self.get_entitlements()
+        users = User.get_many(emails=emails)
+        found_emails = [user.email for user in users]
+        if len(found_emails) != len(emails):
+            missing_emails = [email for email in emails if email not in found_emails]
+            raise MqValueError(f'Users with emails {missing_emails} not found')
+        if admin:
+            current_entitlements.admin = EntitlementBlock(users=set(current_entitlements.admin.users + users))
+        current_entitlements.view = EntitlementBlock(users=set(current_entitlements.view.users + users))
+        self.set_entitlements(current_entitlements)
 
     def set_currency(self, currency: Currency):
         """
@@ -463,6 +497,7 @@ class PortfolioManager(PositionedEntity):
         :param tags: If the portfolio is a fund of funds, pass in a dictionary corresponding to the tag values
         to retrieve results for a sub-portfolio
         :param return_format: whether to return a dict or a pandas dataframe
+
         :return: a Pandas Dataframe or a Dict of portfolio exposure to macro factors
 
         **Examples**

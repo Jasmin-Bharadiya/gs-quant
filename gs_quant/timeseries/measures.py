@@ -34,7 +34,7 @@ from gs_quant.datetime.gscalendar import GsCalendar
 from gs_quant.datetime.point import relative_date_add
 from gs_quant.markets.securities import *
 from gs_quant.markets.securities import Asset, AssetIdentifier, AssetType as SecAssetType, SecurityMaster
-from gs_quant.target.common import AssetClass, AssetType
+from gs_quant.target.common import AssetClass, AssetType, PricingLocation
 from gs_quant.timeseries import Basket, RelativeDate, Returns, Window, sqrt, volatility
 from gs_quant.timeseries.helper import (_month_to_tenor, _split_where_conditions, _tenor_to_month, _to_offset,
                                         check_forward_looking, get_dataset_data_with_retries, get_df_with_retries,
@@ -1591,13 +1591,16 @@ def basis(asset: Asset, termination_tenor: str, *, source: str = None, real_time
 
 @plot_measure((AssetClass.FX,), (AssetType.Cross,), [MeasureDependency(
     id_provider=cross_to_usd_based_cross, query_type=QueryType.FX_FORECAST)])
-def fx_forecast(asset: Asset, relativePeriod: FxForecastHorizon = FxForecastHorizon.THREE_MONTH, *,
+def fx_forecast(asset: Asset, relativePeriod: FxForecastHorizon = FxForecastHorizon.THREE_MONTH,
+                relative_period: Optional[FxForecastHorizon] = None,
+                *,
                 source: str = None, real_time: bool = False, request_id: Optional[str] = None) -> Series:
     """
     FX forecasts made by Global Investment Research (GIR) macro analysts.
 
     :param asset: asset object loaded from security master
-    :param relativePeriod: Forecast horizon. One of: 3m, 6m, 12m, EOY1, EOY2, EOY3, EOY4
+    :param relativePeriod: (deprecated) Forecast horizon. One of: 3m, 6m, 12m, EOY1, EOY2, EOY3, EOY4
+    :param relative_period: Forecast horizon. One of: 3m, 6m, 12m, EOY1, EOY2, EOY3, EOY4
     :param source: name of function caller
     :param real_time: whether to retrieve intraday data instead of EOD
     :param request_id: service request id, if any
@@ -1606,6 +1609,9 @@ def fx_forecast(asset: Asset, relativePeriod: FxForecastHorizon = FxForecastHori
     if real_time:
         raise NotImplementedError('realtime fx_forecast not implemented')
 
+    if relativePeriod:
+        log_warning(request_id, _logger, "'relativePeriod' is deprecated, please use 'relative_period' instead.")
+
     cross_mqid = asset.get_marquee_id()
     usd_based_cross_mqid = cross_to_usd_based_cross(cross_mqid)
     query_type = QueryType.FX_FORECAST
@@ -1613,7 +1619,7 @@ def fx_forecast(asset: Asset, relativePeriod: FxForecastHorizon = FxForecastHori
     q = GsDataApi.build_market_data_query(
         [usd_based_cross_mqid],
         query_type,
-        where=dict(relativePeriod=relativePeriod),
+        where=dict(relativePeriod=relative_period or relativePeriod),
         source=source,
         real_time=real_time
     )
@@ -3632,6 +3638,10 @@ def current_constituents_dividend_yield(asset: Asset, period: str, period_direct
     if real_time:
         raise NotImplementedError('real-time current_constituents_dividend_yield not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_dividend_yield not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_DIVIDEND_YIELD.value
 
@@ -3667,6 +3677,9 @@ def current_constituents_earnings_per_share(asset: Asset, period: str,
     if real_time:
         raise NotImplementedError('real-time current_constituents_earnings_per_share not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_earnings_per_share not implemented for this basket. '
+                                  'Only available for flagship baskets')
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_EARNINGS_PER_SHARE.value
 
@@ -3701,6 +3714,10 @@ def current_constituents_earnings_per_share_positive(asset: Asset, period: str,
     """
     if real_time:
         raise NotImplementedError('real-time current_constituents_earnings_per_share_positive not implemented')
+
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_earnings_per_share_positive not implemented for this basket. '
+                                  'Only available for flagship baskets')
 
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_EARNINGS_PER_SHARE_POSITIVE.value
@@ -3737,6 +3754,10 @@ def current_constituents_net_debt_to_ebitda(asset: Asset, period: str,
     if real_time:
         raise NotImplementedError('real-time current_constituents_net_debt_to_ebitda not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_net_debt_to_ebitda not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_NET_DEBT_TO_EBITDA.value
 
@@ -3771,6 +3792,10 @@ def current_constituents_price_to_book(asset: Asset, period: str, period_directi
     if real_time:
         raise NotImplementedError('real-time current_constituents_price_to_book not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_price_to_book not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_PRICE_TO_BOOK.value
 
@@ -3804,6 +3829,10 @@ def current_constituents_price_to_cash(asset: Asset, period: str, period_directi
     """
     if real_time:
         raise NotImplementedError('real-time current_constituents_price_to_cash not implemented')
+
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_price_to_cash not implemented for this basket. '
+                                  'Only available for flagship baskets')
 
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_PRICE_TO_CASH.value
@@ -3840,6 +3869,10 @@ def current_constituents_price_to_earnings(asset: Asset, period: str,
     if real_time:
         raise NotImplementedError('real-time current_constituents_price_to_earnings not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_price_to_earnings not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_PRICE_TO_EARNINGS.value
 
@@ -3875,6 +3908,10 @@ def current_constituents_price_to_earnings_positive(asset: Asset, period: str,
     if real_time:
         raise NotImplementedError('real-time current_constituents_price_to_earnings_positive not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_price_to_earnings_positive not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_PRICE_TO_EARNINGS_POSITIVE.value
 
@@ -3908,6 +3945,10 @@ def current_constituents_price_to_sales(asset: Asset, period: str, period_direct
     """
     if real_time:
         raise NotImplementedError('real-time current_constituents_price_to_sales not implemented')
+
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_price_to_sales not implemented for this basket. '
+                                  'Only available for flagship baskets')
 
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_PRICE_TO_SALES.value
@@ -3943,6 +3984,10 @@ def current_constituents_return_on_equity(asset: Asset, period: str, period_dire
     if real_time:
         raise NotImplementedError('real-time current_constituents_return_on_equity not implemented')
 
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_return_on_equity not implemented for this basket. '
+                                  'Only available for flagship baskets')
+
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_RETURN_ON_EQUITY.value
 
@@ -3976,6 +4021,10 @@ def current_constituents_sales_per_share(asset: Asset, period: str, period_direc
     """
     if real_time:
         raise NotImplementedError('real-time current_constituents_sales_per_share not implemented')
+
+    if not asset.get_entity().get('parameters', {'flagship': False}).get('flagship', False):
+        raise NotImplementedError('current_constituents_sales_per_share not implemented for this basket. '
+                                  'Only available for flagship baskets')
 
     mqid = asset.get_marquee_id()
     metric = DataMeasure.CURRENT_CONSTITUENTS_SALES_PER_SHARE.value
@@ -4062,9 +4111,15 @@ def realized_correlation(asset: Asset, tenor: str, top_n_of_index: Optional[int]
     if len(weighted_vols) == 0:
         raise MqValueError(f'no data for constituents of {asset}')
 
-    s1 = pd.concat(weighted_vols, axis=1).sum(1, min_count=1)
-    s2 = pd.concat(map(lambda x: x * x, weighted_vols), axis=1).sum(1, min_count=1)
+    # expected number of data points for each pricing date. All assets required, i.e. do not calculate
+    # if constituent is missing on that day
+    min_no_of_assets = top_n_of_index
+    s1 = pd.concat(weighted_vols, axis=1).sum(1, min_count=min_no_of_assets).dropna()
+    s2 = pd.concat(map(lambda x: x * x, weighted_vols), axis=1).sum(1, min_count=min_no_of_assets).dropna()
+
     idx_vol = volatility(df_asset['spot'], Window(tenor, tenor)) / 100
+    idx_vol = idx_vol[idx_vol.index.isin(s1.index)]
+
     values = (idx_vol * idx_vol - s2) / (s1 * s1 - s2) * 100
     series = ExtendedSeries(values)
     series.dataset_ids = getattr(df, 'dataset_ids', ())
@@ -4075,8 +4130,8 @@ def realized_correlation(asset: Asset, tenor: str, top_n_of_index: Optional[int]
               [QueryType.SPOT],
               asset_type_excluded=(AssetType.CommodityEUNaturalGasHub, AssetType.CommodityNaturalGasHub,))
 def realized_volatility(asset: Asset, w: Union[Window, int, str] = Window(None, 0),
-                        returns_type: Returns = Returns.LOGARITHMIC, *, source: str = None, real_time: bool = False,
-                        request_id: Optional[str] = None) -> Series:
+                        returns_type: Returns = Returns.LOGARITHMIC, pricing_location: Optional[PricingLocation] = None,
+                        *, source: str = None, real_time: bool = False, request_id: Optional[str] = None) -> Series:
     """
     Realized volatility for an asset.
 
@@ -4084,19 +4139,37 @@ def realized_volatility(asset: Asset, w: Union[Window, int, str] = Window(None, 
     :param w: number of observations to use; defaults to length of series. If string is provided, should be
         in relative date form (e.g. "1d", "1w", "1m", "1y", etc).
     :param returns_type: returns type: logarithmic or simple
+    :param pricing_location: EOD Location if multiple available Example - "HKG", "LDN", "NYC"
     :param source: name of function caller
     :param real_time: whether to retrieve intraday data instead of EOD
     :param request_id: service request id, if any
     :return: realized volatility curve
     """
-    q = GsDataApi.build_market_data_query(
-        [asset.get_marquee_id()],
-        QueryType.SPOT,
-        source=source,
-        real_time=real_time
-    )
-    log_debug(request_id, _logger, 'q %s', q)
-    df = get_historical_and_last_for_measure([asset.get_marquee_id()], QueryType.SPOT, {}, source=source)
+
+    if asset.asset_class != AssetClass.FX or real_time:
+        q = GsDataApi.build_market_data_query(
+            [asset.get_marquee_id()],
+            QueryType.SPOT,
+            source=source,
+            real_time=real_time
+        )
+        log_debug(request_id, _logger, 'q %s', q)
+        df = get_historical_and_last_for_measure([asset.get_marquee_id()], QueryType.SPOT, {}, source=source,
+                                                 real_time=real_time)
+    else:
+        location = pricing_location if pricing_location else PricingLocation.NYC
+        where = dict(pricingLocation=location.value)
+        q = GsDataApi.build_market_data_query(
+            [asset.get_marquee_id()],
+            QueryType.SPOT,
+            where=where,
+            source=source,
+            real_time=real_time
+        )
+        log_debug(request_id, _logger, 'q %s', q)
+        df = get_historical_and_last_for_measure([asset.get_marquee_id()], QueryType.SPOT, where, source=source,
+                                                 real_time=real_time)
+
     spot = df['spot']
     spot = spot[~spot.index.duplicated(keep='first')]
     series = ExtendedSeries(dtype=float) if df.empty else ExtendedSeries(volatility(spot, w, returns_type))

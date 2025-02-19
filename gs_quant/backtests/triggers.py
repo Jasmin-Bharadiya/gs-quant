@@ -54,6 +54,10 @@ class TriggerRequirements:
     def get_trigger_times(self):
         return []
 
+    @property
+    def calc_type(self):
+        return CalcType.simple
+
 
 @dataclass_json
 @dataclass
@@ -101,7 +105,14 @@ class PeriodicTriggerRequirements(TriggerRequirements):
     def has_triggered(self, state: dt.date, backtest: BackTest = None) -> TriggerInfo:
         if not self.trigger_dates:
             self.get_trigger_times()
-        return TriggerInfo(state in self.trigger_dates)
+        if state in self.trigger_dates:
+            next_state = None
+            if self.trigger_dates.index(state) != len(self.trigger_dates) - 1:
+                next_state = self.trigger_dates[self.trigger_dates.index(state) + 1]
+            return TriggerInfo(True, {AddTradeAction: AddTradeActionInfo(scaling=None, next_schedule=next_state),
+                                      AddScaledTradeAction: AddScaledTradeActionInfo(next_schedule=next_state),
+                                      HedgeAction: HedgeActionInfo(next_schedule=next_state)})
+        return TriggerInfo(False)
 
 
 @dataclass_json
@@ -155,6 +166,8 @@ class RiskTriggerRequirements(TriggerRequirements):
     class_type: str = static_field('risk_trigger_requirements')
 
     def has_triggered(self, state: dt.date, backtest: BackTest = None) -> TriggerInfo:
+        if state not in backtest.results:
+            return TriggerInfo(False)
         if self.risk_transformation is None:
             risk_value = backtest.results[state][self.risk].aggregate()
         else:
@@ -162,6 +175,10 @@ class RiskTriggerRequirements(TriggerRequirements):
                 risk_transformation=self.risk_transformation).aggregate(
                 allow_mismatch_risk_keys=True)
         return check_barrier(self.direction, risk_value, self.trigger_level)
+
+    @property
+    def calc_type(self):
+        return CalcType.path_dependent
 
 
 @dataclass_json
@@ -200,6 +217,19 @@ class AggregateTriggerRequirements(TriggerRequirements):
         else:
             raise RuntimeError(f'Unrecognised aggregation type: {self.aggregate_type}')
 
+    @property
+    def calc_type(self):
+        seen_types = set()
+        for trigger in self.triggers:
+            seen_types.add(trigger.calc_type)
+
+        if CalcType.path_dependent in seen_types:
+            return CalcType.path_dependent
+        elif CalcType.semi_path_dependent in seen_types:
+            return CalcType.semi_path_dependent
+        else:
+            return CalcType.simple
+
 
 @dataclass_json
 @dataclass
@@ -236,12 +266,19 @@ class DateTriggerRequirements(TriggerRequirements):
 
     def has_triggered(self, state: Union[dt.date, dt.datetime], backtest: BackTest = None) -> TriggerInfo:
         if self.entire_day:
+            dates = sorted(self.dates_from_datetimes)
             if isinstance(state, dt.datetime):
-                return TriggerInfo(state.date() in self.dates_from_datetimes)
-            elif isinstance(state, dt.date):
-                return TriggerInfo(state in self.dates_from_datetimes)
-
-        return TriggerInfo(state in self.dates)
+                state = state.date()
+        else:
+            dates = sorted(self.dates)
+        if state in dates:
+            next_state = None
+            if dates.index(state) < len(dates) - 1:
+                next_state = dates[dates.index(state) + 1]
+            return TriggerInfo(True, {AddTradeAction: AddTradeActionInfo(scaling=None, next_schedule=next_state),
+                                      AddScaledTradeAction: AddScaledTradeActionInfo(next_schedule=next_state),
+                                      HedgeAction: HedgeActionInfo(next_schedule=next_state)})
+        return TriggerInfo(False)
 
     def get_trigger_times(self):
         return self.dates_from_datetimes or self.dates
@@ -308,6 +345,72 @@ class MeanReversionTriggerRequirements(TriggerRequirements):
 
 @dataclass_json
 @dataclass
+class TradeCountTriggerRequirements(TriggerRequirements):
+    trade_count: float = field(default=None, metadata=field_metadata)
+    direction: TriggerDirection = field(default=None, metadata=field_metadata)
+    class_type: str = static_field('trade_count_requirements')
+
+    def has_triggered(self, state: dt.date, backtest: BackTest = None) -> TriggerInfo:
+        value = len(backtest.portfolio_dict.get(state, []))
+        if self.direction == TriggerDirection.ABOVE:
+            if value > self.trade_count:
+                return TriggerInfo(True)
+        elif self.direction == TriggerDirection.BELOW:
+            if value < self.trade_count:
+                return TriggerInfo(True)
+        else:
+            if value == self.trade_count:
+                return TriggerInfo(True)
+        return TriggerInfo(False)
+
+    @property
+    def calc_type(self):
+        return CalcType.path_dependent
+
+
+@dataclass_json
+@dataclass
+class EventTriggerRequirements(TriggerRequirements):
+    event_name: str = field(default=None, metadata=field_metadata)
+    offset_days: int = 0
+    data_source: DataSource = field(default=None, metadata=config(decoder=dc_decode(*DataSource.sub_classes(),
+                                                                                    allow_missing=True)))
+    class_type: str = static_field('event_requirements')
+    trigger_dates = []
+
+    def __post_init__(self):
+        if self.data_source is None:
+            self.data_source = GsDataSource(data_set='MACRO_EVENTS_CALENDAR', asset_id=None, value_header='eventName')
+
+    def get_trigger_times(self) -> [dt.date]:
+        if not self.trigger_dates:
+            kwargs = {'eventName': self.event_name}
+            self.trigger_dates = [d.date() + dt.timedelta(days=self.offset_days) for d in
+                                  self.data_source.get_data(None, **kwargs).index]
+        return self.trigger_dates
+
+    def has_triggered(self, state: dt.date, backtest: BackTest = None) -> TriggerInfo:
+        dates = sorted(self.trigger_dates)
+        if state in dates:
+            next_state = None
+            if dates.index(state) < len(dates) - 1:
+                next_state = dates[dates.index(state) + 1]
+            return TriggerInfo(True, {AddTradeAction: AddTradeActionInfo(scaling=None, next_schedule=next_state),
+                                      AddScaledTradeAction: AddScaledTradeActionInfo(next_schedule=next_state),
+                                      HedgeAction: HedgeActionInfo(next_schedule=next_state)})
+        return TriggerInfo(False)
+
+    @staticmethod
+    def list_events(currency: str,
+                    start=Optional[dt.datetime],
+                    end=Optional[dt.datetime], **kwargs):
+        kwargs['currency'] = currency
+        dataset = Dataset('MACRO_EVENTS_CALENDAR')
+        return dataset.get_data(start, end, **kwargs)['eventName'].unique()
+
+
+@dataclass_json
+@dataclass
 class Trigger:
     trigger_requirements: Optional[TriggerRequirements] = field(default=None, metadata=field_metadata)
     actions: Union[Action, Iterable[Action]] = field(default=None,
@@ -342,7 +445,7 @@ class Trigger:
 
     @property
     def calc_type(self):
-        return CalcType.simple
+        return self.trigger_requirements.calc_type
 
     @property
     def risks(self):
@@ -376,10 +479,6 @@ class MktTrigger(Trigger):
 class StrategyRiskTrigger(Trigger):
     trigger_requirements: RiskTriggerRequirements = field(default=None, metadata=field_metadata)
     class_type: str = static_field('strategy_risk_trigger')
-
-    @property
-    def calc_type(self):
-        return CalcType.path_dependent
 
     @property
     def risks(self):
@@ -419,6 +518,20 @@ class PortfolioTrigger(Trigger):
 class MeanReversionTrigger(Trigger):
     trigger_requirements: MeanReversionTriggerRequirements = field(default=None, metadata=field_metadata)
     class_type: str = static_field('mean_reversion_trigger')
+
+
+@dataclass_json
+@dataclass
+class TradeCountTrigger(Trigger):
+    trigger_requirements: TradeCountTriggerRequirements = field(default=None, metadata=field_metadata)
+    class_type: str = static_field('trade_count_trigger')
+
+
+@dataclass_json
+@dataclass
+class EventTrigger(Trigger):
+    trigger_requirements: EventTriggerRequirements = field(default=None, metadata=field_metadata)
+    class_type: str = static_field('event_trigger')
 
 
 @dataclass_json

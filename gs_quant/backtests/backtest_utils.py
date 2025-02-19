@@ -16,6 +16,13 @@ under the License.
 
 import datetime as dt
 from enum import Enum
+
+from dataclasses import dataclass
+from dataclasses_json import dataclass_json
+
+from typing import Callable, Tuple, Union
+
+from gs_quant.common import CurrencyName
 from gs_quant.datetime.relative_date import RelativeDate
 from gs_quant.instrument import Instrument
 
@@ -24,6 +31,16 @@ class CalcType(Enum):
     simple = 'simple'
     semi_path_dependent = 'semi_path_dependent'
     path_dependent = 'path_dependent'
+
+
+@dataclass_json
+@dataclass
+class CustomDuration:
+    durations: Tuple[Union[str, dt.date, dt.timedelta], ...]
+    function: Callable[[Tuple[Union[str, dt.date, dt.timedelta], ...]], Union[str, dt.date, dt.timedelta]]
+
+    def __hash__(self):
+        return hash((self.durations, self.function))
 
 
 def make_list(thing):
@@ -43,7 +60,7 @@ def make_list(thing):
 final_date_cache = {}
 
 
-def get_final_date(inst, create_date, duration, holiday_calendar=None):
+def get_final_date(inst, create_date, duration, holiday_calendar=None, trigger_info=None):
     global final_date_cache
     cache_key = (inst, create_date, duration, holiday_calendar)
     if cache_key in final_date_cache:
@@ -58,6 +75,13 @@ def get_final_date(inst, create_date, duration, holiday_calendar=None):
     if hasattr(inst, str(duration)):
         final_date_cache[cache_key] = getattr(inst, str(duration))
         return getattr(inst, str(duration))
+    if str(duration).lower() == 'next schedule':
+        if hasattr(trigger_info, 'next_schedule'):
+            return trigger_info.next_schedule or dt.date.max
+        raise RuntimeError('Next schedule not supported by action')
+    if isinstance(duration, CustomDuration):
+        return duration.function(*(get_final_date(inst, create_date, d, holiday_calendar, trigger_info) for
+                                 d in duration.durations))
 
     final_date_cache[cache_key] = RelativeDate(duration, create_date).apply_rule(holiday_calendar=holiday_calendar)
     return final_date_cache[cache_key]
@@ -66,3 +90,26 @@ def get_final_date(inst, create_date, duration, holiday_calendar=None):
 def scale_trade(inst: Instrument, ratio: float):
     new_inst = inst.scale(ratio)
     return new_inst
+
+
+def map_ccy_name_to_ccy(currency_name: Union[str, CurrencyName]):
+    map = {'United States Dollar': 'USD',
+           'Australian Dollar': 'AUD',
+           'Canadian Dollar': 'CAD',
+           'Swiss Franc': 'CHF',
+           'Yuan Renminbi (Hong Kong)': 'CNH',
+           'Czech Republic Koruna': 'CZK',
+           'Euro': 'EUR',
+           'Pound Sterling': 'GBP',
+           'Japanese Yen': 'JPY',
+           'South Korean Won': 'KRW',
+           'Malasyan Ringgit': 'MYR',
+           'Norwegian Krone': 'NOK',
+           'New Zealand Dollar': 'NZD',
+           'Polish Zloty': 'PLN',
+           'Russian Rouble': 'RUB',
+           'Swedish Krona': 'SEK',
+           'South African Rand': 'ZAR',
+           'Yuan Renminbi (Onshore)': 'CHY'}
+
+    return map.get(currency_name.value if isinstance(currency_name, CurrencyName) else currency_name)

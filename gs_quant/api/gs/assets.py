@@ -13,63 +13,136 @@ KIND, either express or implied.  See the License for the
 specific language governing permissions and limitations
 under the License.
 """
-import cachetools
-import cachetools.keys
 import datetime as dt
 import logging
 import os
-import pandas as pd
 import threading
 from enum import auto, Enum
 from functools import wraps
+from typing import Iterable, List, Optional, Tuple, Union, Callable
+
+import backoff
+import cachetools
+import cachetools.keys
+import pandas as pd
 from pydash import get, has
-from typing import Iterable, List, Optional, Tuple, Union
-from gs_quant.target.assets import Asset as __Asset, AssetClass, AssetType, AssetToInstrumentResponse, TemporalXRef,\
+from requests.exceptions import HTTPError
+
+from gs_quant.api.api_cache import ApiRequestCache, InMemoryApiRequestCache
+from gs_quant.common import PositionType
+from gs_quant.errors import MqValueError, MqRateLimitedError, MqTimeoutError, MqInternalServerError
+from gs_quant.instrument import Instrument, Security
+from gs_quant.session import GsSession
+from gs_quant.target.assets import Asset as __Asset, AssetClass, AssetType, AssetToInstrumentResponse, TemporalXRef, \
     Position, EntityQuery, PositionSet, Currency, AssetParameters
 from gs_quant.target.assets import FieldFilterMap
 from gs_quant.target.common import Entitlements
 from gs_quant.target.reports import Report
-from gs_quant.errors import MqValueError
-from gs_quant.instrument import Instrument, Security
-from gs_quant.session import GsSession
-from gs_quant.common import PositionType
-from requests.exceptions import HTTPError
+from gs_quant.tracing import Tracer
 
 _logger = logging.getLogger(__name__)
 IdList = Union[Tuple[str, ...], List]
 ENABLE_ASSET_CACHING = 'GSQ_SEC_MASTER_CACHE'
 
-metalock = threading.Lock()
-invocation_locks = cachetools.LRUCache(1024)  # prevent collection from growing without bound
+
+class AssetCache:
+    def __init__(self, cache: ApiRequestCache, ttl: int, construct_key_fn: Callable):
+        self.__cache = cache
+        self.__ttl = ttl
+        self.__construct_key_fn = construct_key_fn
+
+    @property
+    def ttl(self):
+        return self.__ttl
+
+    @property
+    def cache(self):
+        return self.__cache
+
+    @property
+    def construct_key_fn(self):
+        return self.__construct_key_fn
+
+    def construct_key(self, session: GsSession, *args, **kwargs):
+        return self.construct_key_fn(session, *args, **kwargs)
+
+
+def get_default_cache() -> AssetCache:
+    ttl = 30  # seconds
+
+    def in_memory_key_fn(session, *args, **kwargs):
+        args = [tuple(x) if isinstance(x, list) else x for x in args]  # tuples are hashable
+        for k, v in kwargs.items():
+            if isinstance(v, list):
+                kwargs[k] = tuple(v)
+
+        k = cachetools.keys.hashkey(session, *args, **kwargs)
+        return k
+
+    return AssetCache(cache=InMemoryApiRequestCache(1024, ttl),
+                      ttl=ttl,
+                      construct_key_fn=in_memory_key_fn)
 
 
 def _cached(fn):
     _fn_cache_lock = threading.Lock()
     # short-term cache to avoid retrieving the same data several times in succession
-    cache = cachetools.TTLCache(1024, 30)
+    fallback_cache: AssetCache = get_default_cache()
 
     @wraps(fn)
-    def wrapper(*args, **kwargs):
+    def wrapper(cls, *args, **kwargs):
         if os.environ.get(ENABLE_ASSET_CACHING):
-            args = [tuple(x) if isinstance(x, list) else x for x in args]  # tuples are hashable
-            for k, v in kwargs.items():
-                if isinstance(v, list):
-                    kwargs[k] = tuple(v)
-
-            k = cachetools.keys.hashkey(GsSession.current, *args, **kwargs)
-            with metalock:
-                invocation_lock = invocation_locks.setdefault(f'{fn.__name__}:{k}', threading.Lock())
-            with invocation_lock:
+            _logger.info("Asset caching is enabled")
+            asset_cache = cls.get_cache() or fallback_cache
+            k = asset_cache.construct_key(GsSession.current, fn.__name__, *args, **kwargs)
+            with Tracer("acquiring cache lock"):
+                _logger.debug('cache get: %s', k)
                 with _fn_cache_lock:
-                    result = cache.get(k)
-                if result:
-                    _logger.debug('%s cache hit: %s, %s', fn.__name__, str(args), str(kwargs))
-                    return result
-                result = fn(*args, **kwargs)
+                    result = asset_cache.cache.get(GsSession.current, k)
+            if result:
+                _logger.debug('cache hit: %s', k)
+                return result
+            with Tracer("Executing function"):
+                result = fn(cls, *args, **kwargs)
+            with Tracer("acquiring cache lock"):
+                _logger.debug('cache set: %s', k)
                 with _fn_cache_lock:
-                    cache[k] = result
+                    asset_cache.cache.put(GsSession.current, k, result, ttl=asset_cache.ttl)
         else:
-            result = fn(*args, **kwargs)
+            _logger.debug("Asset caching is disabled, calling function")
+            result = fn(cls, *args, **kwargs)
+        return result
+
+    return wrapper
+
+
+def _cached_async(fn):
+    _fn_cache_lock = threading.Lock()
+    # short-term cache to avoid retrieving the same data several times in succession
+    fallback_cache: AssetCache = get_default_cache()
+
+    @wraps(fn)
+    async def wrapper(cls, *args, **kwargs):
+        if os.environ.get(ENABLE_ASSET_CACHING):
+            _logger.info("Asset caching is enabled")
+            asset_cache = cls.get_cache() or fallback_cache
+            k = asset_cache.construct_key(GsSession.current, fn.__name__, *args, **kwargs)
+            with Tracer("acquiring cache lock"):
+                _logger.debug('cache get: %s', k)
+                with _fn_cache_lock:
+                    result = asset_cache.cache.get(GsSession.current, k)
+            if result:
+                _logger.debug('cache hit: %s', k)
+                return result
+            with Tracer("Executing function"):
+                result = await fn(cls, *args, **kwargs)
+            with Tracer("acquiring cache lock"):
+                _logger.debug('cache set: %s', k)
+                with _fn_cache_lock:
+                    asset_cache.cache.put(GsSession.current, k, result, ttl=asset_cache.ttl)
+        else:
+            _logger.debug("Asset caching is disabled, calling function")
+            result = await fn(cls, *args, **kwargs)
         return result
 
     return wrapper
@@ -103,6 +176,15 @@ class GsTemporalXRef(TemporalXRef):
 
 class GsAssetApi:
     """GS Asset API client implementation"""
+    _cache: Optional[AssetCache] = None
+
+    @classmethod
+    def set_cache(cls, cache: AssetCache):
+        cls._cache = cache
+
+    @classmethod
+    def get_cache(cls) -> Optional[AssetCache]:
+        return cls._cache
 
     @classmethod
     def __create_query(
@@ -149,7 +231,7 @@ class GsAssetApi:
         return response['results']
 
     @classmethod
-    @_cached
+    @_cached_async
     async def get_many_assets_async(
             cls,
             fields: IdList = None,
@@ -210,7 +292,7 @@ class GsAssetApi:
         query = cls.__create_query(fields, as_of, limit, scroll, **kwargs)
         response = GsSession.current._post('/assets/data/query', payload=query)
         results = get(response, 'results')
-        while(has(response, 'scrollId') and len(get(response, 'results'))):
+        while (has(response, 'scrollId') and len(get(response, 'results'))):
             query = cls.__create_query(fields, as_of, limit, scroll, get(response, 'scrollId'), **kwargs)
             response = GsSession.current._post('/assets/data/query', payload=query)
             results += get(response, 'results')
@@ -218,6 +300,12 @@ class GsAssetApi:
 
     @classmethod
     @_cached
+    @backoff.on_exception(lambda: backoff.expo(base=2, factor=2),
+                          (MqTimeoutError, MqInternalServerError),
+                          max_tries=5)
+    @backoff.on_exception(lambda: backoff.constant(90),
+                          MqRateLimitedError,
+                          max_tries=5)
     def resolve_assets(
             cls,
             identifier: [str],
@@ -240,7 +328,7 @@ class GsAssetApi:
             **kwargs
     ) -> Tuple[dict, ...]:
         where = dict(identifier=identifier, **kwargs)
-        query = dict(where=where, limit=limit, fields=fields,  asOfTime=as_of.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        query = dict(where=where, limit=limit, fields=fields, asOfTime=as_of.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
         return GsSession.current._post('/assets/xrefs/query', payload=query).get('results')
 
@@ -264,6 +352,14 @@ class GsAssetApi:
             asset_id: str,
     ) -> GsAsset:
         return GsSession.current._get('/assets/{id}'.format(id=asset_id), cls=GsAsset)
+
+    @classmethod
+    @_cached_async
+    async def get_asset_async(
+            cls,
+            asset_id: str,
+    ) -> GsAsset:
+        return await GsSession.current._get_async('/assets/{id}'.format(id=asset_id), cls=GsAsset)
 
     @classmethod
     def get_asset_by_name(cls, name: str) -> GsAsset:
@@ -318,7 +414,7 @@ class GsAssetApi:
         start_date_str = start_date.isoformat()
 
         if periods > 1:
-            end_dates = pd.date_range(start=start_date, end=end_date, periods=periods, closed='right')
+            end_dates = pd.date_range(start=start_date, end=end_date, periods=periods, inclusive='right')
             for date in end_dates:
                 end_date_str = date.date().isoformat()
                 url = f'/assets/{asset_id}/positions?startDate={start_date_str}&endDate={end_date_str}&type={position_type}'
@@ -326,7 +422,7 @@ class GsAssetApi:
                     position_sets += GsSession.current._get(url)['positionSets']
                     start_date_str = (date.date() + dt.timedelta(days=1)).isoformat()
                 except HTTPError as err:
-                   raise ValueError(f'Unable to fetch position data at {url} with {err}')
+                    raise ValueError(f'Unable to fetch position data at {url} with {err}')
         else:
             end_date_str = end_date.isoformat()
             url = f'/assets/{asset_id}/positions?startDate={start_date_str}&endDate={end_date_str}&type={position_type}'
@@ -340,7 +436,8 @@ class GsAssetApi:
     def get_latest_positions(asset_id: str, position_type: PositionType = None) -> PositionSet:
         url = '/assets/{id}/positions/last'.format(id=asset_id)
         if position_type is not None and position_type is not PositionType.ANY:
-            url += '?type={ptype}'.format(ptype=position_type if isinstance(position_type, str) else position_type.value)
+            url += '?type={ptype}'.format(
+                ptype=position_type if isinstance(position_type, str) else position_type.value)
 
         results = GsSession.current._get(url)['results']
 
@@ -371,7 +468,7 @@ class GsAssetApi:
             positions: Iterable[Position]
     ) -> Tuple[Optional[Union[Instrument, Security]]]:
         asset_ids = tuple(filter(None, (p.asset_id for p in positions)))
-        instrument_infos = GsSession.current._post('/assets/instruments', asset_ids, cls=AssetToInstrumentResponse)\
+        instrument_infos = GsSession.current._post('/assets/instruments', asset_ids, cls=AssetToInstrumentResponse) \
             if asset_ids else {}
 
         instrument_lookup = {i.assetId: (i.instrument, i.sizeField) for i in instrument_infos if i}
@@ -386,7 +483,8 @@ class GsAssetApi:
                 instrument_info = instrument_lookup.get(position.assetId)
                 if instrument_info:
                     instrument, size_field = instrument_info
-                    if instrument is not None and size_field is not None and getattr(instrument, size_field, None) is None:
+                    if instrument is not None and size_field is not None and getattr(instrument, size_field,
+                                                                                     None) is None:
                         setattr(instrument, size_field, position.quantity)
 
             ret += (instrument,)

@@ -24,10 +24,11 @@ import sys
 from abc import abstractmethod
 from configparser import ConfigParser
 from enum import Enum, auto, unique
-from typing import Optional, Union, Iterable
+from typing import Optional, Union, Iterable, Any
 
 import backoff
 import certifi
+import httpx
 import msgpack
 import pandas as pd
 import requests
@@ -40,7 +41,7 @@ from opentracing.tags import HTTP_URL, HTTP_METHOD, HTTP_STATUS_CODE
 from gs_quant import version as APP_VERSION
 from gs_quant.base import Base
 from gs_quant.context_base import ContextBase, nullcontext
-from gs_quant.errors import MqError, MqRequestError, MqAuthenticationError, MqUninitialisedError
+from gs_quant.errors import MqError, MqRequestError, MqAuthenticationError, MqUninitialisedError, error_builder
 from gs_quant.json_encoder import JSONEncoder, encode_default
 from gs_quant.tracing import Tracer
 
@@ -135,6 +136,7 @@ class GsSession(ContextBase):
             self.http_adapter = http_adapter
         self.application_version = application_version
         self.proxies = proxies
+        self.mounts = {key: httpx.HTTPTransport(proxy=val) for key, val in proxies} if proxies else None
         self.redirect_to_mds = redirect_to_mds
 
     @backoff.on_exception(lambda: backoff.expo(factor=2),
@@ -171,10 +173,9 @@ class GsSession(ContextBase):
         return self._session_async and not self._session_async.is_closed
 
     def _init_async(self):
-        import httpx
         if not self._has_async_session():
             self._session_async = httpx.AsyncClient(follow_redirects=True, verify=CustomHttpAdapter.ssl_context(),
-                                                    proxies=self.proxies)
+                                                    mounts=self.mounts)
             self._session_async.headers.update({'X-Application': self.application})
             self._session_async.headers.update({'X-Version': self.application_version})
             self._authenticate_async()
@@ -308,8 +309,8 @@ class GsSession(ContextBase):
                         cls: Optional[type], return_request_id: Optional[bool]):
         if not 199 < response.status_code < 300:
             reason = response.reason if hasattr(response, 'reason') else response.reason_phrase
-            raise MqRequestError(response.status_code, f'{reason}: {response.text}',
-                                 context=f'{request_id}: {method} {url}')
+            raise error_builder(response.status_code, f'{reason}: {response.text}',
+                                context=f'{request_id}: {method} {url}')
         elif 'Content-Type' in response.headers:
             if 'application/x-msgpack' in response.headers['Content-Type']:
                 ret = msgpack.unpackb(response.content, raw=False)
@@ -354,6 +355,8 @@ class GsSession(ContextBase):
             logger.debug('Handling response for [Request ID]: %s [Method]: %s [URL]: %s', request_id, method, url)
             if scope:
                 scope.span.set_tag(HTTP_STATUS_CODE, response.status_code)
+                if response.status_code > 399:
+                    scope.span.set_tag('error', True)
                 scope.span.set_tag('dash.request.id', request_id)
                 scope.span.set_tag('response.content.type', response.headers.get('Content-Type'))
         if response.status_code == 401:
@@ -476,15 +479,18 @@ class GsSession(ContextBase):
                                          return_request_id=return_request_id)
         return ret
 
-    def _connect_websocket(self, path: str, headers: Optional[dict] = None, include_version=True):
+    def _connect_websocket(self, path: str, headers: Optional[dict] = None, include_version=True,
+                           domain: Optional[str] = None, **kwargs: Any):
         import websockets
-        url = 'ws{}{}{}'.format(self.domain[4:], '/' + self.api_version if include_version else '', path)
+        version_path = '/' + self.api_version if include_version else ''
+        url = f'{domain}{version_path}{path}' if domain else f'ws{self.domain[4:]}{version_path}{path}'
         extra_headers = self._headers() + list((headers or {}).items())
         return websockets.connect(url,
                                   extra_headers=extra_headers,
                                   max_size=2 ** 32,
                                   read_limit=2 ** 32,
-                                  ssl=CustomHttpAdapter.ssl_context() if url.startswith('wss') else None)
+                                  ssl=CustomHttpAdapter.ssl_context() if url.startswith('wss') else None,
+                                  **kwargs)
 
     def _headers(self):
         return [('Cookie', 'GSSSO=' + self._session.cookies['GSSSO'])]
@@ -492,6 +498,8 @@ class GsSession(ContextBase):
     def _get_mds_domain(self):
         env_config = GsSession._config_for_environment(self.environment.name)
         current_domain = self.domain.replace('marquee.web', 'marquee')  # remove .web from prod domain
+        if self.environment.name == Environment.QA.name:
+            current_domain = self.domain.replace('marquee-qa.web', 'marquee-qa')  # remove .web from qa domain
 
         is_mds_web = current_domain == Domain.MDS_WEB
         is_env_mds_web = current_domain == env_config['MdsWebDomain']
@@ -565,6 +573,7 @@ class GsSession(ContextBase):
             scopes: Optional[Union[Iterable[Union[Scopes, str]], str]] = (),
             token: str = '',
             is_gssso: bool = False,
+            is_marquee_login: bool = False,
             api_version: str = API_VERSION,
             application: str = DEFAULT_APPLICATION,
             http_adapter: requests.adapters.HTTPAdapter = None,
@@ -592,14 +601,18 @@ class GsSession(ContextBase):
                                                    application=application, http_adapter=http_adapter)
                 except NameError:
                     raise MqUninitialisedError('This option requires gs_quant_auth to be installed')
+            elif is_marquee_login:
+                return MQLoginSession(environment_or_domain, domain=domain, api_version=api_version,
+                                      http_adapter=http_adapter, application_version=application_version,
+                                      application=application, mq_login_token=token)
             else:
                 return PassThroughSession(environment_or_domain, token, api_version=api_version,
                                           application=application, http_adapter=http_adapter, domain=domain)
         else:
             try:
-                return MQLoginSession(environment_or_domain, api_version=api_version, http_adapter=http_adapter,
-                                      application_version=application_version, application=application,
-                                      mq_login_token=token)
+                return MQLoginSession(environment_or_domain, domain=domain, api_version=api_version,
+                                      http_adapter=http_adapter, application_version=application_version,
+                                      application=application, mq_login_token=token)
             except NameError:
                 raise MqUninitialisedError('Unable to obtain MarqueeLogin token. '
                                            'Please use client_id and client_secret to make the query')
@@ -650,13 +663,28 @@ class OAuth2Session(GsSession):
 
 
 class PassThroughSession(GsSession):
+    __config = None
+
+    @classmethod
+    def domain_and_verify(cls, environment_or_domain: str, domain: Optional[str]):
+        if cls.__config is None:
+            cls.__config = ConfigParser()
+            cls.__config.read(os.path.join(os.path.dirname(inspect.getfile(cls)), 'config.ini'))
+
+        verify = False
+        try:
+            domain = cls.__config[environment_or_domain][domain]
+            verify = True
+        except KeyError:
+            domain = environment_or_domain
+        return domain, verify
 
     def __init__(self, environment: str, token, api_version=API_VERSION,
                  application=DEFAULT_APPLICATION, http_adapter=None, domain=None):
         domain = domain if domain is not None else 'AppDomain'
-        verify = True
+        domain, verify = self.domain_and_verify(environment, domain)
 
-        super().__init__(self._config_for_environment(environment)[domain], environment, api_version=api_version,
+        super().__init__(domain, environment, api_version=api_version,
                          application=application, verify=verify, http_adapter=http_adapter)
 
         self.token = token
@@ -681,7 +709,6 @@ try:
                                verify=verify, http_adapter=http_adapter, application_version=application_version)
 
     class PassThroughGSSSOSession(KerberosSessionMixin, GsSession):
-
         def __init__(self, environment: str, token, api_version=API_VERSION,
                      application=DEFAULT_APPLICATION, http_adapter=None, csrf_token=None):
             domain, verify = self.domain_and_verify(environment)
@@ -711,13 +738,15 @@ try:
     from gs_quant_auth.kerberos.session_kerberos import MQLoginMixin
 
     class MQLoginSession(MQLoginMixin, GsSession):
-
-        def __init__(self, environment_or_domain: str, api_version: str = API_VERSION,
+        def __init__(self, environment_or_domain: str, domain: str = Domain.APP, api_version: str = API_VERSION,
                      application: str = DEFAULT_APPLICATION, http_adapter: requests.adapters.HTTPAdapter = None,
                      application_version: str = APP_VERSION, mq_login_token=None):
-            domain, verify = self.domain_and_verify(environment_or_domain)
+            selected_domain, verify = self.domain_and_verify(environment_or_domain)
+            if domain == Domain.MDS_WEB:
+                env_config = self._config_for_environment(environment_or_domain)
+                selected_domain = env_config[domain]
             self.mq_login_token = mq_login_token
-            GsSession.__init__(self, domain, environment_or_domain, api_version=api_version,
+            GsSession.__init__(self, selected_domain, environment_or_domain, api_version=api_version,
                                application=application, verify=verify, http_adapter=http_adapter,
                                application_version=application_version)
 
